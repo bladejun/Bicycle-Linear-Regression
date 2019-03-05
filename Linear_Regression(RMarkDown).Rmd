@@ -1,0 +1,405 @@
+---
+title: "reg_project"
+output:
+  html_document:
+    df_print: paged
+---
+# 0. library 및 함수 불러오기
+```{r , echo=T, include=FALSE}
+library(tidyverse)
+library(car)
+library(corrplot)
+library(ISLR)
+library(glmnet)
+library(timeDate)
+library(lm.beta)
+library(Metrics)
+
+rsquare <- function(true, predicted) {
+  sse <- sum((predicted - true)^2)
+  sst <- sum((true - mean(true))^2)
+  rsq <- 1 - sse / sst
+  
+  if (rsq < 0) rsq <- 0
+  
+  return (rsq)
+}
+
+options(scipen = 100)
+```
+
+# 1. 데이터 로드 및 기본 전처리
+```{r}
+setwd("C:/Users/yyj94/Desktop/회귀분석프로젝트")
+
+db<- read.csv(file             = "db1.csv",
+              header           = TRUE,
+              stringsAsFactors = FALSE)
+
+db <- na.omit(db)
+db$지역 <- as.factor(db$지역)
+
+```
+
+# 2. 추가 전처리
+### 2-1. 존치기간(Month)
+
+  존치기간 - 서울시 공공자전거 이용현황 기준 최초대여일 기준으로 설치 후 잔여기간
+  
+  1. *2015년 09월 설치 : 영등포구 마포구 서대문구*
+  2. *2015년 10월 설치 : 광진구 종로구 성동구 중구*
+  3. *2016년 07월 설치 : 동대문구 양천구 용산구*  
+  4. *2016년 09월 설치 : 은평구*  
+  5. *2017년 04월 설치 : 강동구 강서구*  
+  6. *2017년 05월 설치 : 송파구 성복구 중랑구 노원구 강북구 도봉구 금천구 구로구*  
+  7. *2017년 06월 설치 : 관악구 서초구 동작구 강남구*    
+```{r}
+
+db2 <- db
+
+db2$Month <- unlist(strsplit(as.character(db2$날짜[1]),"-"))[2]
+
+for (i in 1: nrow(db2)){
+  
+  db2$Month[i] <- unlist(strsplit(as.character(db2$날짜[i]),"-"))[2]  
+  
+}
+
+mode(db2$Month) = "numeric"
+
+area <- levels(db2$지역)
+startMonth <- rep(7, 23)
+
+temp_db <- data.frame(area,startMonth)
+
+temp_db$startMonth <- c(6,8,7,6,26,7,7,7,7,17,6,27,27,6,26,7,7,17,27,17,15,26,7)
+
+temp_db
+
+for(i in 1: nrow(db2)){
+  
+  db2$Month[i] <- db2$Month[i] + temp_db[temp_db$area == db2$지역[i],2]
+  
+}
+
+prop.table(table(db2$Month)) # 존치기간 빈도 테이블
+
+db2 %>% 
+  ggplot2::ggplot(mapping = aes(x = Month)) +
+  geom_histogram(fill = "red" , color = "black" , alpha = 0.7) + ggtitle("존치기간별 데이터 빈도 히스토그램")
+
+```
+
+### 2-2.주말 휴일 변수  
+    
+  1. *평일 = 0 *
+  2. *휴일 및 공휴일 = 1 *
+```{r}
+
+db2$날짜 <- as.Date(db2$날짜)
+
+holidays <- as.Date(c("2018-02-15", "2018-02-16", "2018-02-17", "2018-03-01", "2018-05-05",
+                      "2018-05-22","2018-06-06", "2018-08-15","2018-09-23", "2018-09-24", 
+                      "2018-09-25", "2018-10-03", "2018-10-09", "2018-12-25")) # 공휴일
+
+db2$WeekDay[isWeekday(db2$날짜)] <- 0
+db2$WeekDay[isWeekend(db2$날짜)] <- 1
+db2$WeekDay[(db2$날짜) %in% holidays] <- 1
+
+db2$WeekDay <- as.factor(db2$WeekDay)
+
+prop.table(table(db2$WeekDay)) # 평일 = 0 , 휴일 = 1
+
+db2 %>% 
+  dplyr::group_by(WeekDay) %>% #데이터를 MsZoning으로 나눔
+  dplyr::summarise(n = n()) %>% #최종적으로 갖고싶은 값, n() = 데이터의 개수를 세어준다.
+  ggplot2::ggplot(mapping = aes(x= "", y = n , fill = WeekDay))+ #aes에 x축에 넣고싶은 값, y축에 넣고싶은 값 / x축과 y축
+  geom_bar(stat = "identity")+
+  coord_polar("y")+
+ ggtitle("평일(0) , 주말(1)의 비율 파이차트")
+
+```
+
+
+### 2-3. 강수량 수준 변수
+  
+  기상청 기준 강수량 표현
+    
+  * *비 매우 조금 : 강수량 1mm 미만*  
+  * *비 조금 : 강수량 5mm 미만*  
+  * *비 다소 : 강수량 5～20mm 미만*  
+  * *비 다소 많음 : 강수량 20～80mm 미만*  
+  * *비 많음 : 강수량 80mm 이상(주의보 기준)*  
+  * *비 매우 많음 : 강수량 150mm 이상(경보 기준)*  
+  
+  1. **집단 1. 강수량(0   <= x  < 1mm) 맑음 + 비 매우조금**  
+  2. **집단 2. 강수량(1   <= x  < 20mm) 비 조금 + 다소**  
+  3. **집단 3. 강수량(20  <= x ) 비 다소 많음 + 많음 + 매우 많음**  
+
+```{r}
+round(prop.table(table(db2$강수량)),4) * 100
+
+boxplot(db2$강수량) # 일일 강수량은 약 80퍼센트가 1mm 미만으로 조정이 필요함
+
+db2 %>% 
+  ggplot2::ggplot(mapping = aes(x = 강수량)) +
+  geom_histogram() # 히스토그램 결과 대부분이 0인 것을 확인 
+
+# 0이 아닌 강수량 그래프
+
+db2 %>% 
+  filter(강수량 >= 1) %>% 
+  ggplot2::ggplot(mapping = aes(x = 강수량)) +
+  geom_histogram() 
+
+db2 <- db2 %>% 
+  mutate(강수량수준 = ifelse(강수량 < 1 , "1mm미만",
+                           ifelse(강수량 < 20 , "20mm미만", "20mm초과" )))
+
+
+prop.table(table(db2$강수량수준)) # 강수량수준 테이블
+
+db2 %>% 
+  dplyr::group_by(강수량수준) %>% 
+  dplyr::summarise(n = n()) %>% #최종적으로 갖고싶은 값, n() = 데이터의 개수를 세어준다.
+  ggplot2::ggplot(mapping = aes(x= "강수량수준", y = n , fill = 강수량수준))+ #aes에 x축에 넣고싶은 값, y축에 넣고싶은 값 / x축과 y축
+  geom_bar(stat = "identity")+
+  coord_polar("y")+
+ ggtitle("강수량수준의 비율 파이차트")
+
+
+```
+
+
+### 2-4. 최종 데이터 전처리  
+```{r}
+# db - 전처리 전 데이터 셋 -> 모델 1에서 활용
+# db2 - 전처리 후 데이터 셋 -> 그 외 모델에서 활용
+
+
+# 전처리 전 데이터셋 분할 training:test=8:2
+set.seed(seed = 1902)  # 프로젝트 년월
+
+index <- sample(x = 1:2,
+                size = nrow(x = db),
+                replace = TRUE,
+                prob = c(0.8, 0.2))  
+
+train0Set <- db[index == 1, ] # 전처리전db 기준 trainset
+
+
+# 전처리 후 데이터셋 분할 training:test=8:2
+
+set.seed(seed = 1902)  # 프로젝트 년월
+
+index <- sample(x = 1:2,
+                size = nrow(x = db2),
+                replace = TRUE,
+                prob = c(0.8, 0.2))
+
+
+trainSet <- db2[index == 1, ] # 전처리후db 기준 trainset
+testSet  <- db2[index == 2, ]
+
+
+db_train <- trainSet
+db_train0 <- train0Set
+db_test  <- testSet
+
+db2 <- db2[,-c(1,2)]
+db <- db[,-c(1,2)]
+
+db_train0 <- db_train[,-c(1,2)]
+
+db_train <- db_train[,-c(1,2)]
+db_test <- db_test[,-c(1,2)]
+
+str(db2)
+
+
+# 계수 표준화
+db3 <- sapply(X = db2,
+       FUN = function(x)
+         {
+         if((class(x) == "numeric"  | class(x) == "integer")) scale(x = x,
+                                                                    center = min(x),
+                                                                    scale = max(x) - min(x))
+         else rep(x = NA_real_ ,times = length(x))
+         }
+       )
+db3 %>% as.data.frame() %>% str(db3)
+
+db3 <- db3 %>% as.data.frame()
+db3$지역 <- db2$지역
+db3$강수량수준 <- db2$강수량수준
+db3$WeekDay <- db2$WeekDay
+
+trainSet2 <- db3[index == 1, ]
+testSet2  <- db3[index == 2, ]
+
+db_train2 <- trainSet2
+db_test2 <- testSet2
+```
+
+
+
+# 3. 회귀모델 설명
+### 3-1. model_1 전처리 이전 기본 회귀모형
+```{r}
+temp_db <- db_train0
+model_1 <- lm(대여건수 ~., data = temp_db)
+summary(model_1)
+car::vif(model_1)
+
+#다중공선성 문제 발생
+
+```
+
+### 3-2. model_2 전처리 이후 변형 회귀모형
+```{r}
+temp_db <- db_train
+model_2 <- lm(대여건수 ~., data = db_train)
+
+
+summary(model_2) 
+car::vif(model_2)
+
+#다중공선성 문제 발생
+
+```
+
+### 3-3. model_3 backward + 다중공선성 해결 회귀모형
+```{r}
+
+forward_model <- step(model_2, direction = "forward")
+backward_model <- step(model_2, direction = "backward")
+both_model <- step(model_2, direction = "both")
+
+summary(both_model)
+car::vif(both_model)
+
+model_3<- lm(formula = 대여건수 ~ 지역 + 평균기온 + 평균습도 + 
+    평균풍속 + 강수량 + 이산화질소농도 + 오존농도 + 일산화탄소농도 + 
+    미세먼지량 + 초미세먼지량 + Month + WeekDay + 강수량수준, 
+    data = db_train)
+
+summary(model_3)
+car::vif(model_3)
+car::durbinWatsonTest(model_3)
+
+sort(lm.beta::lm.beta(model_3)$standardized, decreasing = TRUE)
+gvlma::gvlma(model_3)
+####### Error에 대한 전체적인 가정은 만족하지 않았다
+```
+
+
+
+
+# 4. Overfitting Solution_A
+### 4-1. outlier관측이 많아서 overfitting 될 가능성이 많다. 
+```{r}
+boxplot(db2$대여건수)
+```
+### 4-2. cook's distance
+* **큰 잔차 ( 이상치 ) 및 / 또는 높은 레버리지를 가진 데이터 포인트 는 회귀의  결과와 정확성을 왜곡시킬 수 있다. 쿡의 거리가 큰 포인트는 분석에서 면밀한 검사를 되받을만한 것으로 간주된다.**
+```{r}
+model_4<- lm(formula = 대여건수 ~ 지역 + 평균기온 + 평균습도 + 
+    평균풍속 + 강수량 + 이산화질소농도 + 오존농도 + 일산화탄소농도 + 
+    미세먼지량 + 초미세먼지량 + Month + WeekDay + 강수량수준, data = db2[-c(2325), ])
+plot(model_4, which = 4, pch="*")
+abline(h = 10*mean(cooks.distance(model_3), col = "red"))
+```
+
+# 5. Overfitting Solution_B (RIDGE, LASSO TEST)
+### 5-1. 기존 모델 RMSE
+```{r}
+predictions <- predict(model_3, db_test)
+original <- rmse(db_test$대여건수, predictions)
+original <- round(original, digits = 1)
+original
+```
+### 5-2. RIDGE, LASSO 모델을 위한 데이터 준비
+```{r}
+ridge_lasso_train_x <- model.matrix(대여건수 ~ 지역 + 평균기온 + 평균습도 + 
+                                    평균풍속 + 강수량 + 이산화질소농도 + 오존농도 + 일산화탄소농도 + 
+                                    미세먼지량 + 초미세먼지량 + Month + WeekDay + 강수량수준, 
+                                    data = db_train)[,-1]
+ridge_lasso_train_y <- db_train$대여건수
+
+ridge_lasso_test_x <- model.matrix(대여건수 ~ 지역 + 평균기온 + 평균습도 + 
+                                   평균풍속 + 강수량 + 이산화질소농도 + 오존농도 + 일산화탄소농도 + 
+                                   미세먼지량 + 초미세먼지량 + Month + WeekDay + 강수량수준,
+                                    data = db_test)[,-1]  
+ridge_lasso_test_y <- db_test$대여건수
+
+ridge_lasso_train_x_nor <- model.matrix(대여건수 ~ 지역 + 평균기온 + 평균습도 + 
+                                        평균풍속 + 강수량 + 이산화질소농도 + 오존농도 + 일산화탄소농도 + 
+                                        미세먼지량 + 초미세먼지량 + Month + WeekDay + 강수량수준,
+                                        data = db_train2)[,-1]  
+ridge_lasso_train_y_nor <- db_train2$대여건수
+
+ridge_lasso_test_x_nor <- model.matrix(대여건수 ~ 지역 + 평균기온 + 평균습도 + 
+                                       평균풍속 + 강수량 + 이산화질소농도 + 오존농도 + 일산화탄소농도 + 
+                                       미세먼지량 + 초미세먼지량 + Month + WeekDay + 강수량수준,
+                                       data = db_test2)[,-1]  
+ridge_lasso_test_y_nor <- db_test2$대여건수
+```
+### 5-3. RIDGE
+```{r}
+# lambda 생성, 10^-2에서 10^10까지의 수를 100등분하여 만든 벡터
+grid <- 10^seq(10, -2, length = 100) 
+ridge.mod <- glmnet(ridge_lasso_train_x, ridge_lasso_train_y, alpha = 0, lambda = grid, thresh = 1e-12)
+
+set.seed(1)
+# cross validation을 이용하여 람다 선택
+cv.out_ridge <- cv.glmnet(ridge_lasso_train_x, ridge_lasso_train_y, alpha = 0) 
+plot(cv.out_ridge)
+# MSE가 최소가 되는 람다
+bestlam_ridge <- cv.out_ridge$lambda.min  
+bestlam_ridge
+ridge.pred <- predict(ridge.mod, s = bestlam_ridge, newx = ridge_lasso_test_x)
+ridge <- rmse(ridge_lasso_test_y, ridge.pred)
+ridge <- round(ridge, digits = 1)
+ridge
+```
+### 5-4. LASSO
+```{r}
+lasso.mod <- glmnet(ridge_lasso_train_x, ridge_lasso_train_y, alpha = 1, lambda = grid)
+
+set.seed(1)
+cv.out_lasso <- cv.glmnet(ridge_lasso_train_x, ridge_lasso_train_y, alpha = 1)
+plot(cv.out_lasso)
+bestlam_lasso <- cv.out_lasso$lambda.min
+bestlam_lasso
+lasso.pred <- predict(lasso.mod, s = bestlam_lasso, newx = ridge_lasso_test_x)
+lasso <- rmse(ridge_lasso_test_y, lasso.pred)
+lasso <- round(lasso, digits = 1)
+lasso
+```
+### 5-5. rmse 시각화
+```{r}
+df <- data.frame(c("org", "ridge", "lasso"), c(original, ridge, lasso))
+colnames(df) <- c("model", "rmse")
+df %>% 
+  ggplot2::ggplot(mapping = aes(x = model, y = rmse)) +
+  geom_point(aes(colour = factor(model)), size = 5) +
+  geom_text(aes(label = rmse), vjust = -1)  +
+  ylim(505, 525)
+```
+### 5-6. norm, lamda에 따른 회귀계수
+```{r}
+cv.out_lasso_nor <- cv.glmnet(ridge_lasso_train_x_nor, ridge_lasso_train_y_nor, alpha = 1)
+plot(cv.out_lasso_nor$glmnet.fit, xvar="norm", label=TRUE)
+plot(cv.out_lasso_nor$glmnet.fit, xvar="lambda", label=TRUE)
+```
+### 5-7. 선택된 lasso 계수 
+```{r}
+out <- glmnet(ridge_lasso_train_x, ridge_lasso_train_y, alpha = 1)
+sort(predict(out, type = "coefficients", s = bestlam_lasso)[1:36,], decreasing = TRUE)
+```
+### 5-8. rsquare 함수
+```{r}
+rsquare(ridge_lasso_test_y, ridge.pred)
+rsquare(ridge_lasso_test_y, lasso.pred)
+```
+
